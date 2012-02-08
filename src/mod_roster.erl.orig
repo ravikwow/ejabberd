@@ -1,8 +1,8 @@
 %%%----------------------------------------------------------------------
-%%% File    : mod_roster_odbc.erl
+%%% File    : mod_roster.erl
 %%% Author  : Alexey Shchepin <alexey@process-one.net>
 %%% Purpose : Roster management
-%%% Created : 15 Dec 2004 by Alexey Shchepin <alexey@process-one.net>
+%%% Created : 11 Dec 2002 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
 %%% ejabberd, Copyright (C) 2002-2011   ProcessOne
@@ -33,7 +33,7 @@
 %%% Roster version is a hash digest of the entire roster.
 %%% No additional data is stored in DB.
 
--module(mod_roster_odbc).
+-module(mod_roster).
 -author('alexey@process-one.net').
 
 -behaviour(gen_mod).
@@ -49,10 +49,12 @@
 	 set_items/3,
 	 remove_user/2,
 	 get_jid_info/4,
+	 item_to_xml/1,
 	 webadmin_page/3,
 	 webadmin_user/4,
 	 get_versioning_feature/2,
-	 roster_versioning_enabled/1]).
+	 roster_versioning_enabled/1,
+	 roster_version/2]).
 
 -include("ejabberd.hrl").
 -include("jlib.hrl").
@@ -63,6 +65,14 @@
 
 start(Host, Opts) ->
     IQDisc = gen_mod:get_opt(iqdisc, Opts, one_queue),
+    mnesia:create_table(roster,[{disc_copies, [node()]},
+				{attributes, record_info(fields, roster)}]),
+    mnesia:create_table(roster_version, [{disc_copies, [node()]},
+    				{attributes, record_info(fields, roster_version)}]),
+
+    update_table(),
+    mnesia:add_table_index(roster, us),
+    mnesia:add_table_index(roster_version, us),
     ejabberd_hooks:add(roster_get, Host,
 		       ?MODULE, get_user_roster, 50),
     ejabberd_hooks:add(roster_in_subscription, Host,
@@ -104,7 +114,7 @@ stop(Host) ->
     ejabberd_hooks:delete(anonymous_purge_hook, Host,
 			  ?MODULE, remove_user, 50),
     ejabberd_hooks:delete(resend_subscription_requests_hook, Host,
-		       ?MODULE, get_in_pending_subscriptions, 50),
+			  ?MODULE, get_in_pending_subscriptions, 50),
     ejabberd_hooks:delete(roster_get_versioning_feature, Host,
 		          ?MODULE, get_versioning_feature, 50),
     ejabberd_hooks:delete(webadmin_page_host, Host,
@@ -113,8 +123,6 @@ stop(Host) ->
 			  ?MODULE, webadmin_user, 50),
     gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, ?NS_ROSTER).
 
-process_iq(From, To, IQ) when ((From#jid.luser == "") andalso (From#jid.lresource == "")) ->
-    process_iq_manager(From, To, IQ);
 
 process_iq(From, To, IQ) ->
     #iq{sub_el = SubEl} = IQ,
@@ -133,7 +141,6 @@ process_local_iq(From, To, #iq{type = Type} = IQ) ->
 	get ->
 	    process_iq_get(From, To, IQ)
     end.
-
 
 roster_hash(Items) ->
 	sha:sha(term_to_binary(
@@ -154,7 +161,7 @@ get_versioning_feature(Acc, Host) ->
 	    Feature = {xmlelement,
 		       "ver",
 		       [{"xmlns", ?NS_ROSTER_VER}],
-		       [{xmlelement, "optional", [], []}]},
+		       []},
 	    [Feature | Acc];
 	false -> []
     end.
@@ -163,17 +170,9 @@ roster_version(LServer ,LUser) ->
 	US = {LUser, LServer},
 	case roster_version_on_db(LServer) of
 		true ->
-			case odbc_queries:get_roster_version(ejabberd_odbc:escape(LServer), ejabberd_odbc:escape(LUser)) of
-				{selected, ["version"], [{Version}]} -> Version;
-				{selected, ["version"], []} -> 
-				%% If for some reason we don't had it on DB. Create a version Id and store it.
-				%% (we did the same on process_iq_get, that is called when client get roster,
-				%%  not sure why it can still not be on DB at this point)
-				RosterVersion = sha:sha(term_to_binary(now())),
-				{atomic, {updated,1}} = odbc_queries:sql_transaction(LServer, fun() ->
-				    odbc_queries:set_roster_version(ejabberd_odbc:escape(LUser), RosterVersion)
-				end),
-				RosterVersion
+			case mnesia:dirty_read(roster_version, US) of
+				[#roster_version{version = V}] -> V;
+				[] -> not_found
 			end;
 		false ->
 			roster_hash(ejabberd_hooks:run_fold(roster_get, LServer, [], [US]))
@@ -189,7 +188,6 @@ process_iq_get(From, To, #iq{sub_el = SubEl} = IQ) ->
     LUser = From#jid.luser,
     LServer = From#jid.lserver,
     US = {LUser, LServer},
-
     try
 	    {ItemsToSend, VersionToSend} = 
 		case {xml:get_tag_attr("ver", SubEl), 
@@ -198,18 +196,15 @@ process_iq_get(From, To, #iq{sub_el = SubEl} = IQ) ->
 		{{value, RequestedVersion}, true, true} ->
 			%% Retrieve version from DB. Only load entire roster
 			%% when neccesary.
-			case odbc_queries:get_roster_version(ejabberd_odbc:escape(LServer), ejabberd_odbc:escape(LUser)) of
-				{selected, ["version"], [{RequestedVersion}]} ->
+			case mnesia:dirty_read(roster_version, US) of
+				[#roster_version{version = RequestedVersion}] ->
 					{false, false};
-				{selected, ["version"], [{NewVersion}]} ->
+				[#roster_version{version = NewVersion}] ->
 					{lists:map(fun item_to_xml/1, 
 						ejabberd_hooks:run_fold(roster_get, To#jid.lserver, [], [US])), NewVersion};
-				{selected, ["version"], []} ->
+				[] ->
 					RosterVersion = sha:sha(term_to_binary(now())),
-					{atomic, {updated,1}} = odbc_queries:sql_transaction(LServer, fun() ->
-									odbc_queries:set_roster_version(ejabberd_odbc:escape(LUser), RosterVersion)
-								  end),
-
+					mnesia:dirty_write(#roster_version{us = US, version = RosterVersion}),
 					{lists:map(fun item_to_xml/1,
 						ejabberd_hooks:run_fold(roster_get, To#jid.lserver, [], [US])), RosterVersion}
 			end;
@@ -238,51 +233,16 @@ process_iq_get(From, To, #iq{sub_el = SubEl} = IQ) ->
     end.
 
 
-get_user_roster(Acc, {LUser, LServer}) ->
-    Items = get_roster(LUser, LServer),
-    lists:filter(fun(#roster{subscription = none, ask = in}) ->
-			 false;
-		    (_) ->
-			 true
-		 end, Items) ++ Acc.
-
-get_roster(LUser, LServer) ->
-    Username = ejabberd_odbc:escape(LUser),
-    case catch odbc_queries:get_roster(LServer, Username) of
-	{selected, ["username", "jid", "nick", "subscription", "ask",
-		    "askmessage", "server", "subscribe", "type"],
-	 Items} when is_list(Items) ->
-	    JIDGroups = case catch odbc_queries:get_roster_jid_groups(LServer, Username) of
-			    {selected, ["jid","grp"], JGrps}
-			    when is_list(JGrps) ->
-				JGrps;
-			    _ ->
-				[]
-			end,
-            GroupsDict =
-                lists:foldl(
-                  fun({J, G}, Acc) ->
-                          dict:append(J, G, Acc)
-                  end, dict:new(), JIDGroups),
-	    RItems = lists:flatmap(
-		       fun(I) ->
-			       case raw_to_record(LServer, I) of
-				   %% Bad JID in database:
-				   error ->
-				       [];
-				   R ->
-				       SJID = jlib:jid_to_string(R#roster.jid),
-				       Groups =
-                                           case dict:find(SJID, GroupsDict) of
-                                               {ok, Gs} -> Gs;
-                                               error -> []
-                                           end,
-				       [R#roster{groups = Groups}]
-			       end
-		       end, Items),
-	    RItems;
+get_user_roster(Acc, US) ->
+    case catch mnesia:dirty_index_read(roster, US, #roster.us) of
+	Items when is_list(Items) ->
+	    lists:filter(fun(#roster{subscription = none, ask = in}) ->
+				 false;
+			    (_) ->
+				 true
+			 end, Items) ++ Acc;
 	_ ->
-	    []
+	    Acc
     end.
 
 
@@ -306,85 +266,67 @@ item_to_xml(Item) ->
 		 remove ->
 		     [{"subscription", "remove"} | Attrs2]
 	     end,
-    Attrs = case ask_to_pending(Item#roster.ask) of
-		out ->
-		    [{"ask", "subscribe"} | Attrs3];
-		both ->
-		    [{"ask", "subscribe"} | Attrs3];
-		_ ->
-		    Attrs3
-	    end,
-    SubEls = lists:map(fun(G) ->
-        		       {xmlelement, "group", [], [{xmlcdata, G}]}
-        	       end, Item#roster.groups),
-    {xmlelement, "item", Attrs, SubEls}.
+    Attrs4 = case ask_to_pending(Item#roster.ask) of
+		 out ->
+		     [{"ask", "subscribe"} | Attrs3];
+		 both ->
+		     [{"ask", "subscribe"} | Attrs3];
+		 _ ->
+		     Attrs3
+	     end,
+    SubEls1 = lists:map(fun(G) ->
+				{xmlelement, "group", [], [{xmlcdata, G}]}
+			end, Item#roster.groups),
+    SubEls = SubEls1 ++ Item#roster.xs,
+    {xmlelement, "item", Attrs4, SubEls}.
 
 
-process_iq_set(From, To, #iq{sub_el = SubEl, id = Id} = IQ) ->
+process_iq_set(From, To, #iq{sub_el = SubEl} = IQ) ->
     {xmlelement, _Name, _Attrs, Els} = SubEl,
-    Managed = is_managed_from_id(Id),
-    lists:foreach(fun(El) -> process_item_set(From, To, El, Managed) end, Els),
+    lists:foreach(fun(El) -> process_item_set(From, To, El) end, Els),
     IQ#iq{type = result, sub_el = []}.
 
-process_item_set(From, To, {xmlelement, _Name, Attrs, Els}, Managed) ->
+process_item_set(From, To, {xmlelement, _Name, Attrs, Els}) ->
     JID1 = jlib:string_to_jid(xml:get_attr_s("jid", Attrs)),
     #jid{user = User, luser = LUser, lserver = LServer} = From,
     case JID1 of
 	error ->
 	    ok;
 	_ ->
+	    JID = {JID1#jid.user, JID1#jid.server, JID1#jid.resource},
 	    LJID = jlib:jid_tolower(JID1),
-	    Username = ejabberd_odbc:escape(LUser),
-	    SJID = ejabberd_odbc:escape(jlib:jid_to_string(LJID)),
 	    F = fun() ->
-			{selected,
-			 ["username", "jid", "nick", "subscription",
-			  "ask", "askmessage", "server", "subscribe", "type"],
-			 Res} = odbc_queries:get_roster_by_jid(LServer, Username, SJID),
+			Res = mnesia:read({roster, {LUser, LServer, LJID}}),
 			Item = case Res of
 				   [] ->
 				       #roster{usj = {LUser, LServer, LJID},
 					       us = {LUser, LServer},
-					       jid = LJID};
+					       jid = JID};
 				   [I] ->
-				       R = raw_to_record(LServer, I),
-				       case R of
-					   %% Bad JID in database:
-					   error ->
-					       #roster{usj = {LUser, LServer, LJID},
-						       us = {LUser, LServer},
-						       jid = LJID};
-					   _ ->
-					       R#roster{
-						 usj = {LUser, LServer, LJID},
-						 us = {LUser, LServer},
-						 jid = LJID,
-						 name = ""}
-				       end
+				       I#roster{jid = JID,
+						name = "",
+						groups = [],
+						xs = []}
 			       end,
-%			Item11 = process_item_attrs(Item, Attrs),
-			Item1 = process_item_attrs_managed(Item, Attrs, Managed),
+			Item1 = process_item_attrs(Item, Attrs),
 			Item2 = process_item_els(Item1, Els),
 			case Item2#roster.subscription of
 			    remove ->
-                   odbc_queries:del_roster(LServer, Username, SJID);
+				mnesia:delete({roster, {LUser, LServer, LJID}});
 			    _ ->
-				ItemVals = record_to_string(Item2),
-				ItemGroups = groups_to_string(Item2),
-				odbc_queries:update_roster(LServer, Username, SJID, ItemVals, ItemGroups)
+				mnesia:write(Item2)
 			end,
-			send_itemset_to_managers(From, Item2, Managed),
 			%% If the item exist in shared roster, take the
 			%% subscription information from there:
 			Item3 = ejabberd_hooks:run_fold(roster_process_item,
 							LServer, Item2, [LServer]),
 			case roster_version_on_db(LServer) of
-				true -> odbc_queries:set_roster_version(ejabberd_odbc:escape(LUser), sha:sha(term_to_binary(now())));
+				true -> mnesia:write(#roster_version{us = {LUser, LServer}, version = sha:sha(term_to_binary(now()))});
 				false -> ok
 			end,
 			{Item, Item3}
 		end,
-	    case odbc_queries:sql_transaction(LServer, F) of
+	    case mnesia:transaction(F) of
 		{atomic, {OldItem, Item}} ->
 		    push_item(User, LServer, To, Item),
 		    case Item#roster.subscription of
@@ -399,7 +341,7 @@ process_item_set(From, To, {xmlelement, _Name, Attrs, Els}, Managed) ->
 		    ok
 	    end
     end;
-process_item_set(_From, _To, _, _Managed) ->
+process_item_set(_From, _To, _) ->
     ok.
 
 process_item_attrs(Item, [{Attr, Val} | Attrs]) ->
@@ -409,7 +351,7 @@ process_item_attrs(Item, [{Attr, Val} | Attrs]) ->
 		error ->
 		    process_item_attrs(Item, Attrs);
 		JID1 ->
-		    JID = {JID1#jid.luser, JID1#jid.lserver, JID1#jid.lresource},
+		    JID = {JID1#jid.user, JID1#jid.server, JID1#jid.resource},
 		    process_item_attrs(Item#roster{jid = JID}, Attrs)
 	    end;
 	"name" ->
@@ -431,13 +373,19 @@ process_item_attrs(Item, []) ->
     Item.
 
 
-process_item_els(Item, [{xmlelement, Name, _Attrs, SEls} | Els]) ->
+process_item_els(Item, [{xmlelement, Name, Attrs, SEls} | Els]) ->
     case Name of
 	"group" ->
 	    Groups = [xml:get_cdata(SEls) | Item#roster.groups],
 	    process_item_els(Item#roster{groups = Groups}, Els);
 	_ ->
-	    process_item_els(Item, Els)
+	    case xml:get_attr_s("xmlns", Attrs) of
+		"" ->
+		    process_item_els(Item, Els);
+		_ ->
+		    XEls = [{xmlelement, Name, Attrs, SEls} | Item#roster.xs],
+		    process_item_els(Item#roster{xs = XEls}, Els)
+	    end
     end;
 process_item_els(Item, [{xmlcdata, _} | Els]) ->
     process_item_els(Item, Els);
@@ -461,12 +409,19 @@ push_item(User, Server, From, Item) ->
 		  end, ejabberd_sm:get_user_resources(User, Server))
     end.
 
-% TODO: don't push to those who not load roster
+% TODO: don't push to those who didn't load roster
 push_item(User, Server, Resource, From, Item) ->
+    push_item(User, Server, Resource, From, Item, not_found).
+
+push_item(User, Server, Resource, From, Item, RosterVersion) ->
+    ExtraAttrs = case RosterVersion of
+	not_found -> [];
+	_ -> [{"ver", RosterVersion}]
+    end,
     ResIQ = #iq{type = set, xmlns = ?NS_ROSTER,
 		id = "push" ++ randoms:get_string(),
 		sub_el = [{xmlelement, "query",
-			   [{"xmlns", ?NS_ROSTER}],
+			   [{"xmlns", ?NS_ROSTER}|ExtraAttrs],
 			   [item_to_xml(Item)]}]},
     ejabberd_router:route(
       From,
@@ -477,54 +432,33 @@ push_item(User, Server, Resource, From, Item) ->
 %% TODO: don't push to those who didn't load roster
 push_item_version(Server, User, From, Item, RosterVersion)  ->
     lists:foreach(fun(Resource) ->
-			  push_item_version(User, Server, Resource, From, Item, RosterVersion)
+			  push_item(User, Server, Resource, From, Item, RosterVersion)
 		end, ejabberd_sm:get_user_resources(User, Server)).
-
-push_item_version(User, Server, Resource, From, Item, RosterVersion) ->
-    IQPush = #iq{type = 'set', xmlns = ?NS_ROSTER,
-		 id = "push" ++ randoms:get_string(),
-		 sub_el = [{xmlelement, "query",
-			    [{"xmlns", ?NS_ROSTER},
-			     {"ver", RosterVersion}],
-			    [item_to_xml(Item)]}]},
-    ejabberd_router:route(
-      From,
-      jlib:make_jid(User, Server, Resource),
-      jlib:iq_to_xml(IQPush)).
 
 get_subscription_lists(_, User, Server) ->
     LUser = jlib:nodeprep(User),
     LServer = jlib:nameprep(Server),
-    Username = ejabberd_odbc:escape(LUser),
-    case catch odbc_queries:get_roster(LServer, Username) of
-	{selected, ["username", "jid", "nick", "subscription", "ask",
-		    "askmessage", "server", "subscribe", "type"],
-	 Items} when is_list(Items) ->
-	    fill_subscription_lists(LServer, Items, [], []);
+    US = {LUser, LServer},
+    case mnesia:dirty_index_read(roster, US, #roster.us) of
+	Items when is_list(Items) ->
+	    fill_subscription_lists(Items, [], []);
 	_ ->
 	    {[], []}
     end.
 
-fill_subscription_lists(LServer, [RawI | Is], F, T) ->
-    I = raw_to_record(LServer, RawI),
-    case I of
-	%% Bad JID in database:
-	error ->
-	    fill_subscription_lists(LServer, Is, F, T);
+fill_subscription_lists([I | Is], F, T) ->
+    J = element(3, I#roster.usj),
+    case I#roster.subscription of
+	both ->
+	    fill_subscription_lists(Is, [J | F], [J | T]);
+	from ->
+	    fill_subscription_lists(Is, [J | F], T);
+	to ->
+	    fill_subscription_lists(Is, F, [J | T]);
 	_ ->
-	    J = I#roster.jid,
-	    case I#roster.subscription of
-		both ->
-		    fill_subscription_lists(LServer, Is, [J | F], [J | T]);
-		from ->
-		    fill_subscription_lists(LServer, Is, [J | F], T);
-		to ->
-		    fill_subscription_lists(LServer, Is, F, [J | T]);
-		_ ->
-		    fill_subscription_lists(LServer, Is, F, T)
-	    end
+	    fill_subscription_lists(Is, F, T)
     end;
-fill_subscription_lists(_LServer, [], F, T) ->
+fill_subscription_lists([], F, T) ->
     {F, T}.
 
 ask_to_pending(subscribe) -> out;
@@ -542,35 +476,20 @@ out_subscription(User, Server, JID, Type) ->
 process_subscription(Direction, User, Server, JID1, Type, Reason) ->
     LUser = jlib:nodeprep(User),
     LServer = jlib:nameprep(Server),
+    US = {LUser, LServer},
     LJID = jlib:jid_tolower(JID1),
-    Username = ejabberd_odbc:escape(LUser),
-    SJID = ejabberd_odbc:escape(jlib:jid_to_string(LJID)),
     F = fun() ->
-		Item =
-		    case odbc_queries:get_roster_by_jid(LServer, Username, SJID) of
-			{selected,
-			 ["username", "jid", "nick", "subscription", "ask",
-			  "askmessage", "server", "subscribe", "type"],
-			 [I]} ->
-			    %% raw_to_record can return error, but
-			    %% jlib_to_string would fail before this point
-			    R = raw_to_record(LServer, I),
-			    Groups =
-				case odbc_queries:get_roster_groups(LServer, Username, SJID) of
-				    {selected, ["grp"], JGrps} when is_list(JGrps) ->
-					[JGrp || {JGrp} <- JGrps];
-				    _ ->
-					[]
-				end,
-			    R#roster{groups = Groups};
-			{selected,
-			 ["username", "jid", "nick", "subscription", "ask",
-			  "askmessage", "server", "subscribe", "type"],
-			 []} ->
-			    #roster{usj = {LUser, LServer, LJID},
-				    us = {LUser, LServer},
-				    jid = LJID}
-		    end,
+		Item = case mnesia:read({roster, {LUser, LServer, LJID}}) of
+			   [] ->
+			       JID = {JID1#jid.user,
+				      JID1#jid.server,
+				      JID1#jid.resource},
+			       #roster{usj = {LUser, LServer, LJID},
+				       us = US,
+				       jid = JID};
+			   [I] ->
+			       I
+		       end,
 		NewState = case Direction of
 			       out ->
 				   out_state_change(Item#roster.subscription,
@@ -599,22 +518,21 @@ process_subscription(Direction, User, Server, JID1, Type, Reason) ->
 			{none, AutoReply};
 		    {none, none} when Item#roster.subscription == none,
 		                      Item#roster.ask == in ->
-			odbc_queries:del_roster(LServer, Username, SJID),
+			mnesia:delete({roster, {LUser, LServer, LJID}}),
 			{none, AutoReply};
 		    {Subscription, Pending} ->
 			NewItem = Item#roster{subscription = Subscription,
 					      ask = Pending,
-					      askmessage = AskMessage},
-			ItemVals = record_to_string(NewItem),
-			odbc_queries:roster_subscribe(LServer, Username, SJID, ItemVals),
+					      askmessage = list_to_binary(AskMessage)},
+			mnesia:write(NewItem),
 			case roster_version_on_db(LServer) of
-				true -> odbc_queries:set_roster_version(ejabberd_odbc:escape(LUser), sha:sha(term_to_binary(now())));
+				true -> mnesia:write(#roster_version{us = {LUser, LServer}, version = sha:sha(term_to_binary(now()))});
 				false -> ok
 			end,
 			{{push, NewItem}, AutoReply}
 		end
 	end,
-    case odbc_queries:sql_transaction(LServer, F) of
+    case mnesia:transaction(F) of
 	{atomic, {Push, AutoReply}} ->
 	    case AutoReply of
 		none ->
@@ -645,7 +563,6 @@ process_subscription(Direction, User, Server, JID1, Type, Reason) ->
 	_ ->
 	    false
     end.
-
 
 %% in_state_change(Subscription, Pending, Type) -> NewState
 %% NewState = none | {NewSubscription, NewPending}
@@ -746,10 +663,15 @@ in_auto_reply(_,    _,    _)  ->           none.
 remove_user(User, Server) ->
     LUser = jlib:nodeprep(User),
     LServer = jlib:nameprep(Server),
-    Username = ejabberd_odbc:escape(LUser),
+    US = {LUser, LServer},
     send_unsubscription_to_rosteritems(LUser, LServer),
-    odbc_queries:del_user_roster_t(LServer, Username),
-    ok.
+    F = fun() ->
+		lists:foreach(fun(R) ->
+				      mnesia:delete_object(R)
+			      end,
+			      mnesia:index_read(roster, US, #roster.us))
+        end,
+    mnesia:transaction(F).
 
 %% For each contact with Subscription:
 %% Both or From, send a "unsubscribed" presence stanza;
@@ -802,37 +724,35 @@ set_items(User, Server, SubEl) ->
     {xmlelement, _Name, _Attrs, Els} = SubEl,
     LUser = jlib:nodeprep(User),
     LServer = jlib:nameprep(Server),
-    catch odbc_queries:sql_transaction(
-	    LServer,
-	    lists:flatmap(fun(El) ->
-				  process_item_set_t(LUser, LServer, El)
-			  end, Els)).
+    F = fun() ->
+		lists:foreach(fun(El) ->
+				      process_item_set_t(LUser, LServer, El)
+			      end, Els)
+	end,
+    mnesia:transaction(F).
 
 process_item_set_t(LUser, LServer, {xmlelement, _Name, Attrs, Els}) ->
     JID1 = jlib:string_to_jid(xml:get_attr_s("jid", Attrs)),
     case JID1 of
 	error ->
-	    [];
+	    ok;
 	_ ->
+	    JID = {JID1#jid.user, JID1#jid.server, JID1#jid.resource},
 	    LJID = {JID1#jid.luser, JID1#jid.lserver, JID1#jid.lresource},
-	    Username = ejabberd_odbc:escape(LUser),
-	    SJID = ejabberd_odbc:escape(jlib:jid_to_string(LJID)),
 	    Item = #roster{usj = {LUser, LServer, LJID},
 			   us = {LUser, LServer},
-			   jid = LJID},
+			   jid = JID},
 	    Item1 = process_item_attrs_ws(Item, Attrs),
 	    Item2 = process_item_els(Item1, Els),
 	    case Item2#roster.subscription of
-	        remove ->
-		    odbc_queries:del_roster_sql(Username, SJID);
-	        _ ->
-	            ItemVals = record_to_string(Item1),
-		    ItemGroups = groups_to_string(Item2),
-		    odbc_queries:update_roster_sql(Username, SJID, ItemVals, ItemGroups)
+		remove ->
+		    mnesia:delete({roster, {LUser, LServer, LJID}});
+		_ ->
+		    mnesia:write(Item2)
 	    end
     end;
 process_item_set_t(_LUser, _LServer, _) ->
-    [].
+    ok.
 
 process_item_attrs_ws(Item, [{Attr, Val} | Attrs]) ->
     case Attr of
@@ -841,7 +761,7 @@ process_item_attrs_ws(Item, [{Attr, Val} | Attrs]) ->
 		error ->
 		    process_item_attrs_ws(Item, Attrs);
 		JID1 ->
-		    JID = {JID1#jid.luser, JID1#jid.lserver, JID1#jid.lresource},
+		    JID = {JID1#jid.user, JID1#jid.server, JID1#jid.resource},
 		    process_item_attrs_ws(Item#roster{jid = JID}, Attrs)
 	    end;
 	"name" ->
@@ -876,38 +796,33 @@ process_item_attrs_ws(Item, []) ->
 
 get_in_pending_subscriptions(Ls, User, Server) ->
     JID = jlib:make_jid(User, Server, ""),
-    LUser = JID#jid.luser,
-    LServer = JID#jid.lserver,
-    Username = ejabberd_odbc:escape(LUser),
-    case catch odbc_queries:get_roster(LServer, Username) of
-	{selected, ["username", "jid", "nick", "subscription", "ask",
-		    "askmessage", "server", "subscribe", "type"],
-	 Items} when is_list(Items) ->
+    US = {JID#jid.luser, JID#jid.lserver},
+    case mnesia:dirty_index_read(roster, US, #roster.us) of
+	Result when is_list(Result) ->
     	    Ls ++ lists:map(
 		    fun(R) ->
 			    Message = R#roster.askmessage,
+			    Status  = if is_binary(Message) ->
+					      binary_to_list(Message);
+					 true ->
+					      ""
+				      end,
 			    {xmlelement, "presence",
 			     [{"from", jlib:jid_to_string(R#roster.jid)},
 			      {"to", jlib:jid_to_string(JID)},
 			      {"type", "subscribe"}],
 			     [{xmlelement, "status", [],
-			       [{xmlcdata, Message}]}]}
+			       [{xmlcdata, Status}]}]}
 		    end,
-		    lists:flatmap(
-		      fun(I) ->
-			      case raw_to_record(LServer, I) of
-				  %% Bad JID in database:
-				  error ->
-				      [];
-				  R ->
-				      case R#roster.ask of
-					  in   -> [R];
-					  both -> [R];
-					  _ -> []
-				      end
+		    lists:filter(
+		      fun(R) ->
+			      case R#roster.ask of
+				  in   -> true;
+				  both -> true;
+				  _ -> false
 			      end
 		      end,
-		      Items));
+		      Result));
 	_ ->
 	    Ls
     end.
@@ -917,24 +832,10 @@ get_in_pending_subscriptions(Ls, User, Server) ->
 
 get_jid_info(_, User, Server, JID) ->
     LUser = jlib:nodeprep(User),
-    LServer = jlib:nameprep(Server),
     LJID = jlib:jid_tolower(JID),
-    Username = ejabberd_odbc:escape(LUser),
-    SJID = ejabberd_odbc:escape(jlib:jid_to_string(LJID)),
-    case catch odbc_queries:get_subscription(LServer, Username, SJID) of
-	{selected, ["subscription"], [{SSubscription}]} ->
-	    Subscription = case SSubscription of
-			       "B" -> both;
-			       "T" -> to;
-			       "F" -> from;
-			       _ -> none
-			   end,
-	    Groups = case catch odbc_queries:get_rostergroup_by_jid(LServer, Username, SJID) of
-			 {selected, ["grp"], JGrps} when is_list(JGrps) ->
-			     [JGrp || {JGrp} <- JGrps];
-			 _ ->
-			     []
-		     end,
+    LServer = jlib:nameprep(Server),
+    case catch mnesia:dirty_read(roster, {LUser, LServer, LJID}) of
+	[#roster{subscription = Subscription, groups = Groups}] ->
 	    {Subscription, Groups};
 	_ ->
 	    LRJID = jlib:jid_tolower(jlib:jid_remove_resource(JID)),
@@ -942,21 +843,10 @@ get_jid_info(_, User, Server, JID) ->
 		LRJID == LJID ->
 		    {none, []};
 		true ->
-		    SRJID = ejabberd_odbc:escape(jlib:jid_to_string(LRJID)),
-		    case catch odbc_queries:get_subscription(LServer, Username, SRJID) of
-			{selected, ["subscription"], [{SSubscription}]} ->
-			    Subscription = case SSubscription of
-					       "B" -> both;
-					       "T" -> to;
-					       "F" -> from;
-					       _ -> none
-					   end,
-			    Groups = case catch odbc_queries:get_rostergroup_by_jid(LServer, Username, SRJID) of
-					 {selected, ["grp"], JGrps} when is_list(JGrps) ->
-					     [JGrp || {JGrp} <- JGrps];
-					 _ ->
-					     []
-				     end,
+		    case catch mnesia:dirty_read(
+				 roster, {LUser, LServer, LRJID}) of
+			[#roster{subscription = Subscription,
+				 groups = Groups}] ->
 			    {Subscription, Groups};
 			_ ->
 			    {none, []}
@@ -966,75 +856,65 @@ get_jid_info(_, User, Server, JID) ->
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-raw_to_record(LServer, {User, SJID, Nick, SSubscription, SAsk, SAskMessage,
-			_SServer, _SSubscribe, _SType}) ->
-    case jlib:string_to_jid(SJID) of
-	error ->
-	    error;
-	JID ->
-	    LJID = jlib:jid_tolower(JID),
-	    Subscription = case SSubscription of
-			       "B" -> both;
-			       "T" -> to;
-			       "F" -> from;
-			       _ -> none
-			   end,
-	    Ask = case SAsk of
-		      "S" -> subscribe;
-		      "U" -> unsubscribe;
-		      "B" -> both;
-		      "O" -> out;
-		      "I" -> in;
-		      _ -> none
-		  end,
-	    #roster{usj = {User, LServer, LJID},
-		    us = {User, LServer},
-		    jid = LJID,
-		    name = Nick,
-		    subscription = Subscription,
-		    ask = Ask,
-		    askmessage = SAskMessage}
+
+update_table() ->
+    Fields = record_info(fields, roster),
+    case mnesia:table_info(roster, attributes) of
+	Fields ->
+	    ok;
+	[uj, user, jid, name, subscription, ask, groups, xattrs, xs] ->
+	    convert_table1(Fields);
+	[usj, us, jid, name, subscription, ask, groups, xattrs, xs] ->
+	    convert_table2(Fields);
+	_ ->
+	    ?INFO_MSG("Recreating roster table", []),
+	    mnesia:transform_table(roster, ignore, Fields)
     end.
 
-record_to_string(#roster{us = {User, _Server},
-			 jid = JID,
-			 name = Name,
-			 subscription = Subscription,
-			 ask = Ask,
-			 askmessage = AskMessage}) ->
-    Username = ejabberd_odbc:escape(User),
-    SJID = ejabberd_odbc:escape(jlib:jid_to_string(jlib:jid_tolower(JID))),
-    Nick = ejabberd_odbc:escape(Name),
-    SSubscription = case Subscription of
-			both -> "B";
-			to   -> "T";
-			from -> "F";
-			none -> "N"
-		    end,
-    SAsk = case Ask of
-	       subscribe   -> "S";
-	       unsubscribe -> "U";
-	       both	   -> "B";
-	       out	   -> "O";
-	       in	   -> "I";
-	       none	   -> "N"
-	   end,
-    SAskMessage = ejabberd_odbc:escape(AskMessage),
-    [Username, SJID, Nick, SSubscription, SAsk, SAskMessage, "N", "", "item"].
 
-groups_to_string(#roster{us = {User, _Server},
-			 jid = JID,
-			 groups = Groups}) ->
-    Username = ejabberd_odbc:escape(User),
-    SJID = ejabberd_odbc:escape(jlib:jid_to_string(jlib:jid_tolower(JID))),
+%% Convert roster table to support virtual host
+convert_table1(Fields) ->
+    ?INFO_MSG("Virtual host support: converting roster table from "
+	      "{uj, user, jid, name, subscription, ask, groups, xattrs, xs} format", []),
+    Host = ?MYNAME,
+    {atomic, ok} = mnesia:create_table(
+		     mod_roster_tmp_table,
+		     [{disc_only_copies, [node()]},
+		      {type, bag},
+		      {local_content, true},
+		      {record_name, roster},
+		      {attributes, record_info(fields, roster)}]),
+    mnesia:del_table_index(roster, user),
+    mnesia:transform_table(roster, ignore, Fields),
+    F1 = fun() ->
+		 mnesia:write_lock_table(mod_roster_tmp_table),
+		 mnesia:foldl(
+		   fun(#roster{usj = {U, JID}, us = U} = R, _) ->
+			   mnesia:dirty_write(
+			     mod_roster_tmp_table,
+			     R#roster{usj = {U, Host, JID},
+				      us = {U, Host}})
+		   end, ok, roster)
+	 end,
+    mnesia:transaction(F1),
+    mnesia:clear_table(roster),
+    F2 = fun() ->
+		 mnesia:write_lock_table(roster),
+		 mnesia:foldl(
+		   fun(R, _) ->
+			   mnesia:dirty_write(R)
+		   end, ok, mod_roster_tmp_table)
+	 end,
+    mnesia:transaction(F2),
+    mnesia:delete_table(mod_roster_tmp_table).
 
-    %% Empty groups do not need to be converted to string to be inserted in
-    %% the database
-    lists:foldl(
-      fun([], Acc) -> Acc;
-	 (Group, Acc) ->
- 	      G = ejabberd_odbc:escape(Group),
-	      [[Username, SJID, G]|Acc] end, [], Groups).
+
+%% Convert roster table: xattrs fields become 
+convert_table2(Fields) ->
+    ?INFO_MSG("Converting roster table from "
+	      "{usj, us, jid, name, subscription, ask, groups, xattrs, xs} format", []),
+    mnesia:transform_table(roster, ignore, Fields).
+
 
 webadmin_page(_, Host,
 	      #request{us = _US,
@@ -1047,12 +927,10 @@ webadmin_page(_, Host,
 webadmin_page(Acc, _, _) -> Acc.
 
 user_roster(User, Server, Query, Lang) ->
-    LUser = jlib:nodeprep(User),
-    LServer = jlib:nameprep(Server),
-    US = {LUser, LServer},
-    Items1 = get_roster(LUser, LServer),
+    US = {jlib:nodeprep(User), jlib:nameprep(Server)},
+    Items1 = mnesia:dirty_index_read(roster, US, #roster.us),
     Res = user_roster_parse_query(User, Server, Items1, Query),
-    Items = get_roster(LUser, LServer),
+    Items = mnesia:dirty_index_read(roster, US, #roster.us),
     SItems = lists:sort(Items),
     FItems =
 	case SItems of
@@ -1215,89 +1093,3 @@ us_to_list({User, Server}) ->
 webadmin_user(Acc, _User, _Server, Lang) ->
     Acc ++ [?XE("h3", [?ACT("roster/", "Roster")])].
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
-%% Implement http://jkaluza.fedorapeople.org/remote-roster.html#sect-id188012
-
-%% Handle 2.3 and 2.5
-
-process_iq_manager(From, To, IQ) ->
-    %% Check what access is allowed for From to To
-    MatchDomain = From#jid.lserver,
-    case is_domain_managed(MatchDomain, To#jid.lserver) of
-	true ->
-	    process_iq_manager2(MatchDomain, To, IQ);
-	false ->
-	    #iq{sub_el = SubEl} = IQ,
-	    IQ#iq{type = error, sub_el = [SubEl, ?ERR_BAD_REQUEST]}
-    end.
-
-process_iq_manager2(MatchDomain, To, IQ) ->
-    %% If IQ is SET, filter the input IQ
-    IQFiltered = maybe_filter_request(MatchDomain, IQ),
-    %% Call the standard function with reversed JIDs
-    IdInitial = IQFiltered#iq.id,
-    ResIQ = process_iq(To, To, IQFiltered#iq{id = "roster-remotely-managed"}),
-    %% Filter the output IQ
-    filter_stanza(MatchDomain, ResIQ#iq{id = IdInitial}).
-
-is_domain_managed(ContactHost, UserHost) ->
-    Managers = gen_mod:get_module_opt(UserHost, ?MODULE, managers, []),
-    lists:member(ContactHost, Managers).
-
-maybe_filter_request(MatchDomain, IQ) when IQ#iq.type == set ->
-    filter_stanza(MatchDomain, IQ);
-maybe_filter_request(_MatchDomain, IQ) ->
-    IQ.
-
-filter_stanza(_MatchDomain, #iq{sub_el = []} = IQ) ->
-    IQ;
-filter_stanza(MatchDomain, #iq{sub_el = [SubEl | _]} = IQ) ->
-    #iq{sub_el = SubElFiltered} = IQRes =
-	filter_stanza(MatchDomain, IQ#iq{sub_el = SubEl}),
-    IQRes#iq{sub_el = [SubElFiltered]};
-filter_stanza(MatchDomain, #iq{sub_el = SubEl} = IQ) ->
-    {xmlelement, Type, Attrs, Items} = SubEl,
-    ItemsFiltered = lists:filter(
-		      fun(Item) ->
-			      is_item_of_domain(MatchDomain, Item) end, Items),
-    SubElFiltered = {xmlelement, Type, Attrs, ItemsFiltered},
-    IQ#iq{sub_el = SubElFiltered}.
-
-is_item_of_domain(MatchDomain, {xmlelement, _, Attrs, _}) ->
-    lists:any(fun(Attr) -> is_jid_of_domain(MatchDomain, Attr) end, Attrs);
-is_item_of_domain(_MatchDomain, {xmlcdata, _}) ->
-    false.
-
-is_jid_of_domain(MatchDomain, {"jid", JIDString}) ->
-    case jlib:string_to_jid(JIDString) of
-	JID when JID#jid.lserver == MatchDomain -> true;
-	_ -> false
-    end;
-is_jid_of_domain(_, _) ->
-    false.
-
-%% Handle 2.5
-process_item_attrs_managed(Item, Attrs, true) ->
-    process_item_attrs_ws(Item, Attrs);
-process_item_attrs_managed(Item, _Attrs, false) ->
-    process_item_attrs(Item, _Attrs).
-
-%% Handle 2.4
-send_itemset_to_managers(_From, _Item, true) ->
-    ok;
-send_itemset_to_managers(From, Item, false) ->
-    {_, UserHost} = Item#roster.us,
-    {_ContactUser, ContactHost, _ContactResource} = Item#roster.jid,
-
-    %% Check if the component is an allowed manager
-    IsManager = is_domain_managed(ContactHost, UserHost),
-    case IsManager of
-	true -> push_item("", ContactHost, "", From, Item);
-	false -> ok
-    end.
-
-is_managed_from_id("roster-remotely-managed") ->
-    true;
-is_managed_from_id(_Id) ->
-    false.
