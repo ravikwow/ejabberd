@@ -59,7 +59,8 @@ init(File) ->
 %%          remove_handler                              
 %%----------------------------------------------------------------------
 handle_event(Event, State) ->
-    write_event(State#state.fd, {erlang:localtime(), Event}),
+    %%write_event(State#state.fd, {erlang:localtime(), Event}),
+    write_event(State#state.fd, {{date(),time(),erlang:now()}, Event}),
     {ok, State}.
 
 %%----------------------------------------------------------------------
@@ -90,7 +91,8 @@ handle_info({emulator, _GL, reopen}, State) ->
 	    Error
     end;
 handle_info({emulator, GL, Chars}, State) ->
-    write_event(State#state.fd, {erlang:localtime(), {emulator, GL, Chars}}),
+    %%write_event(State#state.fd, {erlang:localtime(), {emulator, GL, Chars}}),
+    write_event(State#state.fd, {{date(),time(),erlang:now()}, {emulator, GL, Chars}}),
     {ok, State};
 handle_info(_Info, State) ->
     {ok, State}.
@@ -217,7 +219,11 @@ write_time(Time) -> write_time(Time, "ERROR REPORT").
 
 write_time({{Y,Mo,D},{H,Mi,S}}, Type) ->
     io_lib:format("~n=~s==== ~w-~.2.0w-~.2.0w ~.2.0w:~.2.0w:~.2.0w ===~n",
-		  [Type, Y, Mo, D, H, Mi, S]).
+		  [Type, Y, Mo, D, H, Mi, S]);
+
+write_time({{Y,Mo,D},{H,Mi,S},{_Mega,_Sec,MicroS}}, Type) ->
+    io_lib:format("~n=~s==== ~w-~.2.0w-~.2.0w ~.2.0w:~.2.0w:~.2.0w:~p ===~n", 
+		  [Type, Y, Mo, D, H, Mi, S, MicroS]).
 
 %% @doc Rename the log file if exists, to "*-old.log".
 %% This is needed in systems when the file must be closed before rotation (Windows).
