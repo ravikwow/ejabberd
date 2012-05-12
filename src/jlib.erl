@@ -64,6 +64,7 @@
 	 datetime_string_to_timestamp/1,
 	 decode_base64/1,
 	 encode_base64/1,
+	 add_message_uid/2,
 	 ip_to_list/1,
 	 rsm_encode/1,
 	 rsm_encode/2,
@@ -796,6 +797,20 @@ e(62) ->                    $+;
 e(63) ->                    $/;
 e(X) ->                     exit({bad_encode_base64_token, X}).
 
+add_message_uid({xmlelement, Name, Attrs, Els}, Type) ->
+    Res = lists:keymember("uid", 1, Attrs),
+    if ( (Name == "message") and not Res ) ->
+	Gen_UID = fun(Len) ->
+	    Chrs = list_to_tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"),
+	    ChrsSize = size(Chrs),
+	    F = fun(_, R) -> [element(random:uniform(ChrsSize), Chrs) | R] end,
+	    lists:foldl(F, "", lists:seq(1, Len))
+	end,
+	{xmlelement, Name, lists:append([{"uid", Type++"_"++Gen_UID(32)}], Attrs), Els};
+       true ->
+	{xmlelement, Name, Attrs, Els}
+    end.
+    
 %% Convert Erlang inet IP to list
 ip_to_list({IP, _Port}) ->
     ip_to_list(IP);

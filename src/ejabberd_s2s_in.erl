@@ -453,7 +453,7 @@ stream_established({xmlstreamelement, El}, StateData) ->
 			  []}),
 	    {next_state, stream_established, StateData#state{timer = Timer}};
 	_ ->
-	    NewEl = jlib:remove_attr("xmlns", El),
+	    NewEl = jlib:add_message_uid(jlib:remove_attr("xmlns", El), "s2s"),
 	    {xmlelement, Name, Attrs, _Els} = NewEl,
 	    From_s = xml:get_attr_s("from", Attrs),
 	    From = jlib:string_to_jid(From_s),

@@ -238,7 +238,7 @@ wait_for_handshake(closed, StateData) ->
 
 
 stream_established({xmlstreamelement, El}, StateData) ->
-    NewEl = jlib:remove_attr("xmlns", El),
+    NewEl = jlib:add_message_uid(jlib:remove_attr("xmlns", El), "srv"),
     {xmlelement, Name, Attrs, _Els} = NewEl,
     From = xml:get_attr_s("from", Attrs),
     FromJID = case StateData#state.check_from of

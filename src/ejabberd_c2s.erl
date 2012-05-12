@@ -1052,7 +1052,7 @@ session_established2(El, StateData) ->
 		    jlib:string_to_jid(To)
 	    end,
     NewEl1 = jlib:remove_attr("xmlns", El),
-    NewEl = case xml:get_attr_s("xml:lang", Attrs) of
+    NewEl2 = case xml:get_attr_s("xml:lang", Attrs) of
 		"" ->
 		    case StateData#state.lang of
 			"" -> NewEl1;
@@ -1062,6 +1062,7 @@ session_established2(El, StateData) ->
 		_ ->
 		    NewEl1
 	    end,
+    NewEl = jlib:add_message_uid(NewEl2, "c2s"),
     NewState =
 	case ToJID of
 	    error ->
